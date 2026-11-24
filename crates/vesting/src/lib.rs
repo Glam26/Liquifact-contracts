@@ -1667,6 +1667,9 @@ mod authz;
 mod props;
 
 #[cfg(test)]
+mod tranche_revoke_props;
+
+#[cfg(test)]
 mod indexer_fixtures;
 
 #[cfg(test)]
