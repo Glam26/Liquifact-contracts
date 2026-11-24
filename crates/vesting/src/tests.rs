@@ -668,7 +668,7 @@ fn get_schedule_tranche_id_returns_not_found() {
             },
         ],
     );
-    let id = client.create_tranche_schedule(&accounts.user1, &token, &tranches);
+    let id = client.create_tranche_schedule(&accounts.deployer, &accounts.user1, &token, &tranches);
 
     let err = client.try_get_schedule(&id).unwrap_err().unwrap();
     assert_eq!(err, ForgeError::NotFound);
@@ -960,7 +960,8 @@ fn revoke_unknown_or_tranche_id_is_not_found() {
             },
         ],
     );
-    let tranche_id = client.create_tranche_schedule(&accounts.user1, &token, &tranches);
+    let tranche_id =
+        client.create_tranche_schedule(&accounts.deployer, &accounts.user1, &token, &tranches);
     let err = client.try_revoke(&tranche_id).unwrap_err().unwrap();
     assert_eq!(err, ForgeError::NotFound);
 }
@@ -1155,6 +1156,7 @@ fn reassignment_rejects_unknown_tranche_and_completed_schedules() {
     assert_eq!(err, ForgeError::NotFound);
 
     let tranche_id = client.create_tranche_schedule(
+        &accounts.deployer,
         &accounts.user1,
         &token,
         &soroban_sdk::vec![
@@ -1383,7 +1385,8 @@ fn refund_revoked_requires_a_revoked_linear_schedule() {
             amount: 1_000,
         }],
     );
-    let tranche_id = client.create_tranche_schedule(&accounts.user1, &token, &tranches);
+    let tranche_id =
+        client.create_tranche_schedule(&accounts.deployer, &accounts.user1, &token, &tranches);
     assert_eq!(
         client.try_refund_revoked(&tranche_id).unwrap_err().unwrap(),
         ForgeError::NotFound
