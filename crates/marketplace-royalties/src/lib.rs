@@ -1417,6 +1417,8 @@ mod events {
 mod authz;
 #[cfg(test)]
 mod props;
+#[cfg(test)]
+mod tier_props;
 
 #[cfg(test)]
 mod indexer_fixtures;
@@ -3227,5 +3229,309 @@ mod tests {
         assert_eq!(tc.balance(seller), balances_before.1);
         assert_eq!(tc.balance(recipient), balances_before.2);
         assert!(env.events().all().events().is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Price-bracket royalty tiers
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn royalty_tiers_rejects_unsorted_duplicate_bad_start_over_bps_and_over_cap() {
+        let (env, client, accounts) = setup!();
+        let collection = &accounts.arbiter;
+
+        // Valid baseline so we also verify rejected updates never overwrite.
+        let valid = soroban_sdk::vec![&env, (1_i128, 800_u32), (1_000_i128, 400_u32)];
+        client.set_royalty_tiers(collection, &valid);
+
+        // Unsorted minimum amounts.
+        let unsorted = soroban_sdk::vec![
+            &env,
+            (1_i128, 800_u32),
+            (5_000_i128, 300_u32),
+            (1_000_i128, 500_u32),
+        ];
+        assert_eq!(
+            client.try_set_royalty_tiers(collection, &unsorted),
+            Err(Ok(ForgeError::InvalidInput))
+        );
+
+        // Duplicate minimum amounts (both at start and later).
+        let dup_start = soroban_sdk::vec![&env, (1_i128, 800_u32), (1_i128, 400_u32)];
+        assert_eq!(
+            client.try_set_royalty_tiers(collection, &dup_start),
+            Err(Ok(ForgeError::InvalidInput))
+        );
+        let dup_later = soroban_sdk::vec![
+            &env,
+            (1_i128, 800_u32),
+            (1_000_i128, 400_u32),
+            (1_000_i128, 200_u32),
+        ];
+        assert_eq!(
+            client.try_set_royalty_tiers(collection, &dup_later),
+            Err(Ok(ForgeError::InvalidInput))
+        );
+
+        // Does not start at 1 (0, negative, or > 1).
+        for bad_start in [0_i128, -5_i128, 2_i128, 100_i128] {
+            let bad = soroban_sdk::vec![&env, (bad_start, 500_u32)];
+            assert_eq!(
+                client.try_set_royalty_tiers(collection, &bad),
+                Err(Ok(ForgeError::InvalidInput))
+            );
+        }
+
+        // bps > 10_000.
+        let over_bps = soroban_sdk::vec![&env, (1_i128, 500_u32), (1_000_i128, 10_001_u32)];
+        assert_eq!(
+            client.try_set_royalty_tiers(collection, &over_bps),
+            Err(Ok(ForgeError::InvalidInput))
+        );
+
+        // Over MAX_ROYALTY_TIERS cap.
+        let mut over_cap = soroban_sdk::Vec::new(&env);
+        for i in 0..=MAX_ROYALTY_TIERS {
+            over_cap.push_back((i128::from(i) + 1, 100_u32));
+        }
+        assert_eq!(
+            client.try_set_royalty_tiers(collection, &over_cap),
+            Err(Ok(ForgeError::InvalidInput))
+        );
+
+        // Prior valid tiers remain intact after every rejected write.
+        assert_eq!(client.get_royalty_tiers(collection), valid);
+
+        // Exactly MAX_ROYALTY_TIERS is accepted.
+        let mut at_cap = soroban_sdk::Vec::new(&env);
+        for i in 0..MAX_ROYALTY_TIERS {
+            at_cap.push_back((i128::from(i) * 100 + 1, 1_000_u32 - i * 50));
+        }
+        client.set_royalty_tiers(collection, &at_cap);
+        assert_eq!(client.get_royalty_tiers(collection), at_cap);
+    }
+
+    #[test]
+    fn royalty_tiers_respect_collection_max_royalty_cap() {
+        let (env, client, accounts) = setup!();
+        let collection = &accounts.arbiter;
+        client.set_max_royalty_cap(collection, &600_u32);
+
+        let over_cap = soroban_sdk::vec![&env, (1_i128, 601_u32), (1_000_i128, 300_u32)];
+        assert_eq!(
+            client.try_set_royalty_tiers(collection, &over_cap),
+            Err(Ok(ForgeError::InvalidInput))
+        );
+
+        let within_cap = soroban_sdk::vec![&env, (1_i128, 600_u32), (1_000_i128, 250_u32)];
+        client.set_royalty_tiers(collection, &within_cap);
+
+        // Lowering max cap below an active tier is rejected.
+        assert_eq!(
+            client.try_set_max_royalty_cap(collection, &599_u32),
+            Err(Ok(ForgeError::InvalidInput))
+        );
+        assert_eq!(client.get_max_royalty_cap(collection), 600_u32);
+    }
+
+    #[test]
+    fn royalty_tiers_bracket_edges_and_clearing_restore_flat_rate() {
+        let (env, token, tc, contract_id, client, accounts) = setup_settlement!();
+        let collection = &accounts.arbiter;
+        let payer = &accounts.user1;
+        let recipient = &accounts.user2;
+        let seller = &accounts.user3;
+        StellarAssetClient::new(&env, &token).mint(payer, &100_000_i128);
+
+        // Default collection has no tiers and behaves identically to flat 500 bps.
+        assert!(client.get_royalty_tiers(collection).is_empty());
+        let flat_quote = client.quote_sale(collection, &1_000_i128);
+        assert_eq!(flat_quote.royalty_bps, 500);
+        assert_eq!(flat_quote.royalty_amount, 50);
+
+        // Configure 3 descending brackets: [1..999] -> 10%, [1000..4999] -> 5%, [5000..] -> 2%.
+        let tiers = soroban_sdk::vec![
+            &env,
+            (1_i128, 1_000_u32),
+            (1_000_i128, 500_u32),
+            (5_000_i128, 200_u32),
+        ];
+        client.set_royalty_tiers(collection, &tiers);
+        assert_eq!(client.get_royalty_tiers(collection), tiers);
+
+        // Verify exact bracket edges: min - 1, min, min + 1.
+        let cases = [
+            (1_i128, 1_000_u32, 0_i128),
+            (999_i128, 1_000_u32, 99_i128),
+            (1_000_i128, 500_u32, 50_i128),
+            (1_001_i128, 500_u32, 50_i128),
+            (4_999_i128, 500_u32, 249_i128),
+            (5_000_i128, 200_u32, 100_i128),
+            (5_001_i128, 200_u32, 100_i128),
+        ];
+        for (amount, expected_bps, expected_royalty) in cases {
+            let quote = client.quote_sale(collection, &amount);
+            assert_eq!(quote.royalty_bps, expected_bps, "amount={amount}");
+            assert_eq!(quote.royalty_amount, expected_royalty, "amount={amount}");
+            assert_eq!(quote.seller_net, amount - expected_royalty);
+
+            let preview = client.preview_settlement(collection, &amount);
+            assert_eq!(preview.royalty_amount, expected_royalty);
+            assert_eq!(preview.seller_net, amount - expected_royalty);
+            assert_eq!(preview.rounding_residue, 0);
+
+            let recipient_before = tc.balance(recipient);
+            let seller_before = tc.balance(seller);
+            let settled = client.settle_sale(collection, &token, payer, seller, &amount);
+            assert_eq!(settled.royalty_share, quote.royalty_amount);
+            assert_eq!(settled.seller_net, quote.seller_net);
+            assert_eq!(tc.balance(recipient) - recipient_before, expected_royalty);
+            assert_eq!(tc.balance(seller) - seller_before, quote.seller_net);
+        }
+
+        // `distribute` also applies the selected bracket.
+        let recipient_before = tc.balance(recipient);
+        let net = client.distribute(collection, &token, payer, seller, &5_000_i128);
+        assert_eq!(net, 4_900);
+        assert_eq!(tc.balance(recipient) - recipient_before, 100);
+
+        // Clearing via empty vec restores flat 500 bps.
+        client.set_royalty_tiers(collection, &soroban_sdk::Vec::new(&env));
+        assert!(client.get_royalty_tiers(collection).is_empty());
+        let restored = client.quote_sale(collection, &5_000_i128);
+        assert_eq!(restored.royalty_bps, 500);
+        assert_eq!(restored.royalty_amount, 250);
+        assert_eq!(restored.seller_net, 4_750);
+
+        // Re-apply and clear via `clear_royalty_tiers`, checking TTL bump first.
+        client.set_royalty_tiers(collection, &tiers);
+        let tiers_key = DataKey::Tiers(collection.clone());
+        let ledger = env.ledger().sequence();
+        let timestamp = env.ledger().timestamp();
+        advance_ledger_to(&env, ledger + BUMP_AMOUNT - BUMP_THRESHOLD + 1, timestamp);
+        let ttl_before = entry_ttl(&env, &contract_id, &tiers_key);
+        assert!(ttl_before < BUMP_THRESHOLD);
+
+        // `get_royalty_tiers` is strictly read-only: no auth, no events, no TTL bump.
+        env.set_auths(&[]);
+        assert_eq!(client.get_royalty_tiers(collection), tiers);
+        assert!(env.events().all().events().is_empty());
+        assert_eq!(entry_ttl(&env, &contract_id, &tiers_key), ttl_before);
+
+        // `touch_ttl` extends the tiers entry TTL.
+        client.touch_ttl(collection);
+        assert_eq!(entry_ttl(&env, &contract_id, &tiers_key), BUMP_AMOUNT);
+
+        // Clearing via `clear_royalty_tiers` removes tiers and restores flat behavior.
+        env.mock_all_auths();
+        client.clear_royalty_tiers(collection);
+        assert!(client.get_royalty_tiers(collection).is_empty());
+        let settled_after_clear =
+            client.settle_sale(collection, &token, payer, seller, &5_000_i128);
+        assert_eq!(settled_after_clear.royalty_share, 250);
+        assert_eq!(settled_after_clear.seller_net, 4_750);
+    }
+
+    #[test]
+    fn royalty_tiers_mixed_bracket_batch_with_multi_recipient_split() {
+        let (env, token, tc, contract_id, client, accounts) = setup_settlement!();
+        let collection = &accounts.arbiter;
+        let payer = &accounts.user1;
+        let recipient_a = &accounts.user2;
+        let recipient_b = &accounts.deployer;
+        let seller_a = &accounts.user3;
+        let seller_b = &accounts.validator;
+        StellarAssetClient::new(&env, &token).mint(payer, &20_000_i128);
+
+        // 60/40 split ratio (300 / 200 bps).
+        let splits = soroban_sdk::vec![
+            &env,
+            RoyaltyShare {
+                recipient: recipient_a.clone(),
+                bps: 300,
+            },
+            RoyaltyShare {
+                recipient: recipient_b.clone(),
+                bps: 200,
+            },
+        ];
+        client.set_royalty_splits(collection, &splits);
+
+        // Brackets: [1..999] -> 1000 bps (10%), [1000..4999] -> 500 bps (5%), [5000..] -> 250 bps (2.5%).
+        let tiers = soroban_sdk::vec![
+            &env,
+            (1_i128, 1_000_u32),
+            (1_000_i128, 500_u32),
+            (5_000_i128, 250_u32),
+        ];
+        client.set_royalty_tiers(collection, &tiers);
+
+        // Batch mixes all three brackets, hitting edges 999, 1000, 4999, 5000.
+        let amounts = [999_i128, 1_000_i128, 4_999_i128, 5_000_i128];
+        let batch = sales_of(
+            &env,
+            &[
+                (seller_a.clone(), amounts[0]),
+                (seller_b.clone(), amounts[1]),
+                (seller_a.clone(), amounts[2]),
+                (seller_b.clone(), amounts[3]),
+            ],
+        );
+
+        let quotes: std::vec::Vec<SaleQuote> = amounts
+            .iter()
+            .map(|a| client.quote_sale(collection, a))
+            .collect();
+        let previews: std::vec::Vec<SettlementPreview> = amounts
+            .iter()
+            .map(|a| client.preview_settlement(collection, a))
+            .collect();
+
+        assert_eq!(quotes[0].royalty_bps, 1_000);
+        assert_eq!(quotes[1].royalty_bps, 500);
+        assert_eq!(quotes[2].royalty_bps, 500);
+        assert_eq!(quotes[3].royalty_bps, 250);
+
+        // Expected per-recipient floored shares:
+        // 999 @ 10% (60/40): A = floor(999*1000*300/5_000_000) = 59, B = floor(999*1000*200/5_000_000) = 39 => roy 98, net 901
+        // 1000 @ 5% (60/40): A = 30, B = 20 => roy 50, net 950
+        // 4999 @ 5% (60/40): A = floor(4999*500*300/5_000_000) = 149, B = floor(4999*500*200/5_000_000) = 99 => roy 248, net 4751
+        // 5000 @ 2.5% (60/40): A = 75, B = 50 => roy 125, net 4875
+        let settled = client.settle_sales(collection, &token, payer, &batch);
+        assert_eq!(settled.len(), 4);
+        for (i, amount) in amounts.iter().enumerate() {
+            let s = settled.get(i as u32).unwrap();
+            assert_eq!(s.royalty_share, quotes[i].royalty_amount);
+            assert_eq!(s.seller_net, quotes[i].seller_net);
+            assert_eq!(s.royalty_share, previews[i].royalty_amount);
+            assert_eq!(s.seller_net, previews[i].seller_net);
+            assert_eq!(s.royalty_share + s.seller_net, *amount);
+        }
+
+        assert_eq!(tc.balance(recipient_a), 59 + 30 + 149 + 75);
+        assert_eq!(tc.balance(recipient_b), 39 + 20 + 99 + 50);
+        assert_eq!(tc.balance(seller_a), 901 + 4_751);
+        assert_eq!(tc.balance(seller_b), 950 + 4_875);
+        assert_eq!(tc.balance(&contract_id), 0);
+
+        let total_gross: i128 = amounts.iter().sum();
+        let total_royalties = tc.balance(recipient_a) + tc.balance(recipient_b);
+        assert_eq!(
+            total_royalties + tc.balance(seller_a) + tc.balance(seller_b),
+            total_gross
+        );
+        assert_eq!(
+            client.get_settlement_summary(collection),
+            SettlementSummary {
+                sales: 4,
+                gross_volume: total_gross,
+                royalties_paid: total_royalties,
+            }
+        );
+
+        // i128::MAX boundary stays overflow-free under tiered multi-recipient splits.
+        let max_quote = client.quote_sale(collection, &i128::MAX);
+        assert_eq!(max_quote.royalty_bps, 250);
+        assert_eq!(max_quote.royalty_amount + max_quote.seller_net, i128::MAX);
     }
 }
